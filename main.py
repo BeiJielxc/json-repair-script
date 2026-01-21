@@ -4,335 +4,391 @@ import json
 from typing import Tuple, List
 
 
-RE_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
-RE_LINE_COMMENT = re.compile(r"//.*?$", re.M)
+# ============================================================================
+# 第一层：核心处理器类 - 封装所有JSON修复算法
+# ============================================================================
 
-# Very common: unquoted key in object: { name: "x" }
-# Capture: start or { or [ or , or newline, then optional spaces, key token, spaces, :
-RE_UNQUOTED_KEY = re.compile(
-    r'([{\[,\n]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)',
-    flags=re.M
-)
-
-# Trailing comma before ] or }
-RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
-
-# Missing comma between adjacent structures: } {  or } "key" or ] { etc.
-RE_MISSING_COMMA_1 = re.compile(r"(\}|\]|\")\s*(\{|\[|\")")
-# Specifically between two objects in array: } {  (most common)
-RE_MISSING_COMMA_OBJ = re.compile(r"(\})\s*(\{)")
-
-# Normalize non-JSON literals
-RE_TRUE = re.compile(r"\bTrue\b")
-RE_FALSE = re.compile(r"\bFalse\b")
-RE_NULL_UPPER = re.compile(r"\bNULL\b")
-
-
-def strip_comments(s: str) -> str:
-    s2 = RE_BLOCK_COMMENT.sub("", s)
-    s3 = RE_LINE_COMMENT.sub("", s2)
-    return s3
-
-
-def normalize_literals(s: str) -> str:
-    s = RE_TRUE.sub("true", s)
-    s = RE_FALSE.sub("false", s)
-    s = RE_NULL_UPPER.sub("null", s)
-    return s
-
-
-def fix_chinese_quotes(s: str) -> str:
-    """将中文引号替换为对应的英文符号（作为普通字符）"""
-    # 这是一个全局替换，将中文引号字符替换为普通文本
-    s = s.replace('"', '＂')  # 中文左引号 -> 全角双引号
-    s = s.replace('"', '＂')  # 中文右引号 -> 全角双引号
-    s = s.replace(''', "'")   # 中文左单引号 -> 英文单引号
-    s = s.replace(''', "'")   # 中文右单引号 -> 英文单引号
-    return s
-
-
-def quote_unquoted_keys(s: str) -> str:
-    # 改进：递归处理嵌套结构中的未加引号键名
-    def replacer(match):
-        return f'{match.group(1)}"{match.group(2)}"{match.group(3)}'
-
-    # 重复应用直到没有更多匹配（处理嵌套情况）
-    max_iterations = 10
-    for _ in range(max_iterations):
-        new_s = RE_UNQUOTED_KEY.sub(replacer, s)
-        if new_s == s:
-            break
-        s = new_s
-    return s
-
-
-def escape_special_characters(s: str) -> str:
-    # 简化版本：不进行额外转义，因为大多数情况下字符串已经正确
-    # 过度转义会导致问题（如反斜杠指数增长）
-    # 如果真的需要转义，应该在更早的阶段处理
-    return s
-
-
-def remove_trailing_commas(s: str) -> str:
-    # Repeat until stable, because nested patterns may appear
-    prev = None
-    while prev != s:
-        prev = s
-        s = RE_TRAILING_COMMA.sub(r"\1", s)
-    return s
-
-
-def fix_misplaced_brackets(s: str) -> Tuple[str, List[str]]:
+class JSONRepairProcessor:
     """
-    修复错位的括号，例如：
-    "key": "value"] 应该是 "key": "value" }]
-    """
-    diagnostics = []
-    lines = s.split('\n')
+    JSON修复核心处理器
     
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-        
-        # 检测模式：值后面直接跟 ] 
-        # 匹配: "xxx"]  或  123]  或  true]
-        if stripped.endswith(']') and not stripped.endswith(']]'):
-            # 检查 ] 之前是否有合适的值结束
-            before_bracket = stripped[:-1].rstrip()
-            if not before_bracket:  # 如果只有一个 ]，跳过
-                continue
-            if before_bracket.endswith('"') or before_bracket.endswith('}') or \
-               before_bracket[-1].isdigit() or before_bracket.endswith('true') or \
-               before_bracket.endswith('false') or before_bracket.endswith('null'):
-                
-                # 检查前面的上下文（包括当前行到 ] 之前的内容）
-                content_before = '\n'.join(lines[:i]) + '\n' + before_bracket
-                
-                # 统计括号（忽略字符串内的）
-                in_string = False
-                escape = False
-                open_obj = 0
-                open_arr = 0
-                
-                for char in content_before:
-                    if escape:
-                        escape = False
-                        continue
-                    if char == '\\':
-                        escape = True
-                        continue
-                    if char == '"':
-                        in_string = not in_string
-                        continue
-                    if not in_string:
-                        if char == '{':
-                            open_obj += 1
-                        elif char == '}':
-                            open_obj -= 1
-                        elif char == '[':
-                            open_arr += 1
-                        elif char == ']':
-                            open_arr -= 1
-                
-                # 如果有未闭合的对象且数组也未闭合，在 ] 前插入 }
-                if open_obj > 0 and open_arr > 0:
-                    # 在 ] 之前插入 }，并换行
-                    indent = len(line) - len(line.lstrip())
-                    new_line = before_bracket + '\n' + ' ' * indent + '}\n' + ' ' * max(0, indent-4) + ']'
-                    lines[i] = new_line
-                    diagnostics.append(f"Inserted '}}' before ']' on line {i+1}")
-                    return '\n'.join(lines), diagnostics
+    职责：
+    - 包含所有修复算法
+    - 无状态设计（所有方法都是静态的）
+    - 可以独立使用，也可以被其他类调用
+    - 易于测试和维护
     
-    return s, diagnostics
-
-
-def insert_missing_commas(s: str) -> str:
+    架构：采用静态方法，避免全局命名空间污染
     """
-    改进：处理各种缺少逗号的情况
-    1. 对象/数组后直接跟着另一个对象/数组
-    2. 值后直接跟着键名
-    3. 特别处理换行的情况
-    4. 同行内连续的键值对
-    5. 数组/对象闭合后直接跟键名
-    """
-    max_iterations = 10
-    for _ in range(max_iterations):
-        prev = s
-        
-        # 处理 } { 或 ] { 或 } [ 等模式（可能跨行）
-        s = RE_MISSING_COMMA_OBJ.sub(r"\1, \2", s)
-        s = RE_MISSING_COMMA_1.sub(r"\1, \2", s)
-        
-        # 处理换行后的情况: }\n{  或  }\n  {
-        s = re.sub(r'(\}|\])\s*\n\s*(\{|\[)', r'\1,\n\2', s)
-        
-        # 处理对象/数组闭合后，同一行或下一行直接跟键名的情况
-        # 例如: }  "key"  或  ]  "key"
-        s = re.sub(r'(\}|\])\s+(")', r'\1, \2', s)
-        
-        # 新增：处理同一行内，数字/字符串后直接跟键名的情况
-        # 例如: "price": 5999 "quantity": 2
-        # 匹配: 数字或字符串结束后，空格，然后是引号开始的键名
-        s = re.sub(r'(\d+|"[^"]*")\s+("[\w]+"\s*:)', r'\1, \2', s)
-        
-        # 新增：处理换行后，值结束直接跟键名
-        # 例如: 5999\n"quantity"
-        s = re.sub(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
-        
-        # 新增：处理 } 或 ] 后直接换行跟 "key"
-        s = re.sub(r'(\}|\])\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
-        
-        if s == prev:
-            break
     
-    return s
-
-
-def remove_duplicate_keys(s: str) -> str:
-    # 改进：尝试解析JSON并移除重复键名
-    # 注意：这个函数在字符串级别处理重复键很困难，
-    # 更好的方法是在JSON解析后处理，这里暂时简化处理
-    try:
-        # 尝试加载JSON，Python的json.loads会自动使用最后出现的重复键
-        obj = json.loads(s)
-        return json.dumps(obj, ensure_ascii=False)
-    except:
-        # 如果无法解析，返回原字符串
+    # ========== 正则表达式（类变量） ==========
+    RE_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+    RE_LINE_COMMENT = re.compile(r"//.*?$", re.M)
+    RE_UNQUOTED_KEY = re.compile(
+        r'([{\[,\n]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)',
+        flags=re.M
+    )
+    RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+    RE_MISSING_COMMA_1 = re.compile(r"(\}|\]|\")\s*(\{|\[|\")")
+    RE_MISSING_COMMA_OBJ = re.compile(r"(\})\s*(\{)")
+    RE_TRUE = re.compile(r"\bTrue\b")
+    RE_FALSE = re.compile(r"\bFalse\b")
+    RE_NULL_UPPER = re.compile(r"\bNULL\b")
+    
+    # ========== 基础清理方法 ==========
+    
+    @staticmethod
+    def strip_comments(s: str) -> str:
+        """去除JSON字符串中的注释"""
+        s2 = JSONRepairProcessor.RE_BLOCK_COMMENT.sub("", s)
+        s3 = JSONRepairProcessor.RE_LINE_COMMENT.sub("", s2)
+        return s3
+    
+    @staticmethod
+    def normalize_literals(s: str) -> str:
+        """规范化布尔值和null字面量"""
+        s = JSONRepairProcessor.RE_TRUE.sub("true", s)
+        s = JSONRepairProcessor.RE_FALSE.sub("false", s)
+        s = JSONRepairProcessor.RE_NULL_UPPER.sub("null", s)
         return s
-
-
-def fix_missing_values(s: str) -> str:
-    # 新增：修复键值对中缺失的值
-    return re.sub(r'"(\w+)":\s*,', r'"\1": null,', s)
-
-
-def fix_unclosed_strings_linewise(s: str) -> Tuple[str, List[str]]:
-    """
-    Heuristic: if a line has an odd number of unescaped double quotes,
-    append a closing quote at end of line.
-    """
-    diagnostics = []
-    lines = s.splitlines()
-    fixed_lines = []
-
-    for i, line in enumerate(lines, start=1):
-        # Count unescaped quotes:
-        # remove escaped quotes \" first
-        tmp = re.sub(r'\\"', '', line)
-        quote_count = tmp.count('"')
-        if quote_count % 2 == 1:
-            # If line contains // comment already stripped, this likely means unclosed string.
-            diagnostics.append(f"Line {i}: suspected unclosed string; appended '\"'")
-            fixed_lines.append(line + '"')
-        else:
-            fixed_lines.append(line)
-
-    return "\n".join(fixed_lines), diagnostics
-
-
-def balance_brackets_smart(s: str) -> Tuple[str, List[str]]:
-    """
-    智能平衡括号：使用栈追踪嵌套结构，在正确位置插入缺失的括号
-    """
-    diagnostics = []
     
-    # 移除字符串内容以避免干扰（简化版）
-    def strip_strings(text: str) -> str:
-        # 替换字符串内容为空字符串，保留引号结构
-        result = []
-        in_string = False
-        escape_next = False
-        for char in text:
-            if escape_next:
-                escape_next = False
-                result.append(' ')
-                continue
-            if char == '\\':
-                escape_next = True
-                result.append(' ')
-                continue
-            if char == '"':
-                in_string = not in_string
-                result.append('"')
-            elif not in_string:
-                result.append(char)
-            else:
-                result.append(' ')
-        return ''.join(result)
+    @staticmethod
+    def fix_chinese_quotes(s: str) -> str:
+        """将中文引号替换为对应的英文符号（作为普通字符）"""
+        s = s.replace('"', '＂')  # 中文左引号 -> 全角双引号
+        s = s.replace('"', '＂')  # 中文右引号 -> 全角双引号
+        s = s.replace(''', "'")   # 中文左单引号 -> 英文单引号
+        s = s.replace(''', "'")   # 中文右单引号 -> 英文单引号
+        return s
     
-    stripped = strip_strings(s)
-    
-    # 使用栈追踪未闭合的括号
-    stack = []
-    positions = []  # 记录每个开括号的位置
-    
-    for i, char in enumerate(stripped):
-        if char in '{[':
-            stack.append(char)
-            positions.append(i)
-        elif char in '}]':
-            expected = '{' if char == '}' else '['
-            if stack and stack[-1] == expected:
-                stack.pop()
-                positions.pop()
-    
-    # 如果有未闭合的括号，在末尾添加
-    if stack:
-        closing = []
-        for bracket in reversed(stack):
-            if bracket == '{':
-                closing.append('}')
-            else:
-                closing.append(']')
+    @staticmethod
+    def quote_unquoted_keys(s: str) -> str:
+        """为未加引号的键名添加引号"""
+        def replacer(match):
+            return f'{match.group(1)}"{match.group(2)}"{match.group(3)}'
         
-        s += ''.join(closing)
-        diagnostics.append(f"Appended {len(closing)} missing brackets: {''.join(closing)}")
+        max_iterations = 10
+        for _ in range(max_iterations):
+            new_s = JSONRepairProcessor.RE_UNQUOTED_KEY.sub(replacer, s)
+            if new_s == s:
+                break
+            s = new_s
+        return s
     
-    return s, diagnostics
-
-
-def smart_insert_brackets_by_error(s: str, error_msg: str) -> Tuple[str, List[str]]:
-    """
-    根据JSON解析错误信息，智能地在指定位置插入缺失的括号
-    """
-    diagnostics = []
+    @staticmethod
+    def escape_special_characters(s: str) -> str:
+        """转义特殊字符（当前版本简化处理）"""
+        # 简化版本：不进行额外转义，因为大多数情况下字符串已经正确
+        # 过度转义会导致问题（如反斜杠指数增长）
+        return s
     
-    # 解析错误信息获取位置
-    # 例如: "Expecting ',' delimiter: line 20 column 13 (char 490)"
-    import re
-    match = re.search(r'line (\d+) column (\d+)', error_msg)
-    if not match:
-        return s, diagnostics
+    @staticmethod
+    def remove_trailing_commas(s: str) -> str:
+        """删除尾随逗号"""
+        prev = None
+        while prev != s:
+            prev = s
+            s = JSONRepairProcessor.RE_TRAILING_COMMA.sub(r"\1", s)
+        return s
     
-    error_line = int(match.group(1))
-    error_col = int(match.group(2))
-    
-    lines = s.split('\n')
-    if error_line > len(lines):
-        return s, diagnostics
-    
-    # 获取错误位置之前的内容，分析括号平衡
-    content_before = '\n'.join(lines[:error_line])
-    
-    # 简单的栈分析：查找未闭合的括号类型
-    def analyze_brackets(text: str) -> List[str]:
-        """返回未闭合的括号列表"""
-        stack = []
-        in_string = False
-        escape_next = False
+    @staticmethod
+    def fix_misplaced_brackets(s: str) -> Tuple[str, List[str]]:
+        """修复错位的括号，例如: "key": "value"] 应该是 "key": "value" }]"""
+        diagnostics = []
+        lines = s.split('\n')
         
-        for char in text:
-            if escape_next:
-                escape_next = False
-                continue
-            if char == '\\':
-                escape_next = True
-                continue
-            if char == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
+        for i, line in enumerate(lines):
+            stripped = line.rstrip()
+            
+            if stripped.endswith(']') and not stripped.endswith(']]'):
+                before_bracket = stripped[:-1].rstrip()
+                if not before_bracket:
+                    continue
                 
+                # 检查是否是对象值后面跟着 ]（例如 "key": "value"]）
+                # 排除嵌套数组的情况（例如 [1, 2, 3]）
+                is_after_object_value = (
+                    before_bracket.endswith('"') or 
+                    before_bracket.endswith('}') or 
+                    before_bracket.endswith('true') or 
+                    before_bracket.endswith('false') or 
+                    before_bracket.endswith('null')
+                )
+                
+                # 如果是数字结尾，检查是否在数组上下文中
+                if before_bracket and before_bracket[-1].isdigit():
+                    # 检查这一行是否包含逗号或数组开始符号，这通常意味着是数组元素
+                    if '[' in stripped or ',' in stripped:
+                        # 这很可能是数组元素，不需要修复
+                        continue
+                    is_after_object_value = True
+                
+                if is_after_object_value:
+                    content_before = '\n'.join(lines[:i]) + '\n' + before_bracket
+                    
+                    in_string = False
+                    escape = False
+                    open_obj = 0
+                    open_arr = 0
+                    
+                    for char in content_before:
+                        if escape:
+                            escape = False
+                            continue
+                        if char == '\\':
+                            escape = True
+                            continue
+                        if char == '"':
+                            in_string = not in_string
+                            continue
+                        if not in_string:
+                            if char == '{':
+                                open_obj += 1
+                            elif char == '}':
+                                open_obj -= 1
+                            elif char == '[':
+                                open_arr += 1
+                            elif char == ']':
+                                open_arr -= 1
+                    
+                    # 只有当有未闭合的对象且数组也未闭合，并且看起来像对象值时才插入 }
+                    if open_obj > 0 and open_arr > 0:
+                        indent = len(line) - len(line.lstrip())
+                        new_line = before_bracket + '\n' + ' ' * indent + '}\n' + ' ' * max(0, indent-4) + ']'
+                        lines[i] = new_line
+                        diagnostics.append(f"Inserted '}}' before ']' on line {i+1}")
+                        return '\n'.join(lines), diagnostics
+        
+        return s, diagnostics
+    
+    @staticmethod
+    def insert_missing_commas(s: str) -> str:
+        """插入缺失的逗号"""
+        max_iterations = 10
+        for _ in range(max_iterations):
+            prev = s
+            
+            s = JSONRepairProcessor.RE_MISSING_COMMA_OBJ.sub(r"\1, \2", s)
+            s = JSONRepairProcessor.RE_MISSING_COMMA_1.sub(r"\1, \2", s)
+            
+            s = re.sub(r'(\}|\])\s*\n\s*(\{|\[)', r'\1,\n\2', s)
+            s = re.sub(r'(\}|\])\s+(")', r'\1, \2', s)
+            s = re.sub(r'(\d+|"[^"]*")\s+("[\w]+"\s*:)', r'\1, \2', s)
+            s = re.sub(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
+            s = re.sub(r'(\}|\])\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
+            
+            if s == prev:
+                break
+        
+        return s
+    
+    @staticmethod
+    def remove_duplicate_keys(s: str) -> str:
+        """移除重复的键名"""
+        try:
+            obj = json.loads(s)
+            return json.dumps(obj, ensure_ascii=False)
+        except:
+            return s
+    
+    @staticmethod
+    def fix_missing_values(s: str) -> str:
+        """修复键值对中缺失的值"""
+        return re.sub(r'"(\w+)":\s*,', r'"\1": null,', s)
+    
+    @staticmethod
+    def fix_unclosed_strings_linewise(s: str) -> Tuple[str, List[str]]:
+        """修复未闭合的字符串"""
+        diagnostics = []
+        lines = s.splitlines()
+        fixed_lines = []
+        
+        for i, line in enumerate(lines, start=1):
+            tmp = re.sub(r'\\"', '', line)
+            quote_count = tmp.count('"')
+            if quote_count % 2 == 1:
+                diagnostics.append(f"Line {i}: suspected unclosed string; appended '\"'")
+                fixed_lines.append(line + '"')
+            else:
+                fixed_lines.append(line)
+        
+        return "\n".join(fixed_lines), diagnostics
+    
+    @staticmethod
+    def balance_brackets_smart(s: str) -> Tuple[str, List[str]]:
+        """智能平衡括号：使用栈追踪嵌套结构"""
+        diagnostics = []
+        
+        def strip_strings(text: str) -> str:
+            result = []
+            in_string = False
+            escape_next = False
+            for char in text:
+                if escape_next:
+                    escape_next = False
+                    result.append(' ')
+                    continue
+                if char == '\\':
+                    escape_next = True
+                    result.append(' ')
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    result.append('"')
+                elif not in_string:
+                    result.append(char)
+                else:
+                    result.append(' ')
+            return ''.join(result)
+        
+        stripped = strip_strings(s)
+        
+        stack = []
+        positions = []
+        
+        for i, char in enumerate(stripped):
+            if char in '{[':
+                stack.append(char)
+                positions.append(i)
+            elif char in '}]':
+                expected = '{' if char == '}' else '['
+                if stack and stack[-1] == expected:
+                    stack.pop()
+                    positions.pop()
+        
+        if stack:
+            closing = []
+            for bracket in reversed(stack):
+                if bracket == '{':
+                    closing.append('}')
+                else:
+                    closing.append(']')
+            
+            s += ''.join(closing)
+            diagnostics.append(f"Appended {len(closing)} missing brackets: {''.join(closing)}")
+        
+        return s, diagnostics
+    
+    @staticmethod
+    def smart_insert_brackets_by_error(s: str, error_msg: str) -> Tuple[str, List[str]]:
+        """根据JSON解析错误信息，智能地在指定位置插入缺失的括号"""
+        diagnostics = []
+        
+        match = re.search(r'line (\d+) column (\d+)', error_msg)
+        if not match:
+            return s, diagnostics
+        
+        error_line = int(match.group(1))
+        error_col = int(match.group(2))
+        
+        lines = s.split('\n')
+        if error_line > len(lines):
+            return s, diagnostics
+        
+        content_before = '\n'.join(lines[:error_line])
+        
+        def analyze_brackets(text: str) -> List[str]:
+            stack = []
+            in_string = False
+            escape_next = False
+            
+            for char in text:
+                if escape_next:
+                    escape_next = False
+                    continue
+                if char == '\\':
+                    escape_next = True
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                    
+                if char in '{[':
+                    stack.append(char)
+                elif char in '}]':
+                    expected = '{' if char == '}' else '['
+                    if stack and stack[-1] == expected:
+                        stack.pop()
+            
+            return stack
+        
+        unclosed = analyze_brackets(content_before)
+        
+        if "Expecting ','" in error_msg:
+            error_line_idx = error_line - 1
+            if error_line_idx < len(lines):
+                error_line_text = lines[error_line_idx].strip()
+                
+                if re.search(r'[,\}]\s+"[\w]+"\s*:', error_line_text):
+                    parts = error_line_text.rsplit(',', 1)
+                    if len(parts) == 2:
+                        left_part = parts[0]
+                        right_part = parts[1]
+                        
+                        new_line = lines[error_line_idx].replace(error_line_text, 
+                                                                  f"{left_part}\n    ], {right_part.strip()}")
+                        lines[error_line_idx] = new_line
+                        diagnostics.append(f"Split line {error_line_idx+1} and inserted ']'")
+                        
+                        result = '\n'.join(lines)
+                        result = JSONRepairProcessor.clean_extra_brackets(result)
+                        return result, diagnostics
+                
+                if '[' in unclosed:
+                    for i in range(error_line_idx - 1, -1, -1):
+                        line = lines[i].strip()
+                        if line.endswith('}') or line.endswith(']'):
+                            lines[i] = lines[i].rstrip() + ']'
+                            diagnostics.append(f"Inserted ']' after line {i+1} to close array")
+                            
+                            result = '\n'.join(lines)
+                            result = JSONRepairProcessor.clean_extra_brackets(result)
+                            
+                            return result, diagnostics
+                
+                elif error_line_idx > 0:
+                    prev_line_idx = error_line_idx - 1
+                    prev_line = lines[prev_line_idx].rstrip()
+                    
+                    if (prev_line.endswith(']') or prev_line.endswith('}')) and \
+                       (error_line_text.startswith('"') or error_line_text.startswith('{')):
+                        lines[prev_line_idx] = prev_line + ','
+                        diagnostics.append(f"Inserted ',' after line {prev_line_idx+1}")
+                        return '\n'.join(lines), diagnostics
+        
+        return s, diagnostics
+    
+    @staticmethod
+    def clean_extra_brackets(s: str) -> str:
+        """清理末尾可能多余的括号"""
+        def strip_strings(text: str) -> str:
+            in_string = False
+            escape_next = False
+            result = []
+            for char in text:
+                if escape_next:
+                    escape_next = False
+                    result.append(' ')
+                    continue
+                if char == '\\':
+                    escape_next = True
+                    result.append(' ')
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    result.append('"')
+                elif not in_string:
+                    result.append(char)
+                else:
+                    result.append(' ')
+            return ''.join(result)
+        
+        stripped = strip_strings(s)
+        
+        stack = []
+        for char in stripped:
             if char in '{[':
                 stack.append(char)
             elif char in '}]':
@@ -340,275 +396,305 @@ def smart_insert_brackets_by_error(s: str, error_msg: str) -> Tuple[str, List[st
                 if stack and stack[-1] == expected:
                     stack.pop()
         
-        return stack
-    
-    unclosed = analyze_brackets(content_before)
-    
-    # 如果检测到 "Expecting ','" 错误
-    if "Expecting ','" in error_msg:
-        error_line_idx = error_line - 1
-        if error_line_idx < len(lines):
-            error_line_text = lines[error_line_idx].strip()
-            
-            # 新增：检查错误行是否包含不应该在数组/对象内的键值对
-            # 特征：同一行内有逗号连接的值，然后是键名模式 "key":
-            if re.search(r'[,\}]\s+"[\w]+"\s*:', error_line_text):
-                # 在逗号位置分割，插入缺失的 ]
-                # 找到最后一个逗号的位置
-                parts = error_line_text.rsplit(',', 1)
-                if len(parts) == 2:
-                    left_part = parts[0]  # 数组内的部分
-                    right_part = parts[1]  # 应该在数组外的部分
+        if not stack:
+            try:
+                json.loads(s)
+                return s
+            except:
+                s_stripped = s.rstrip()
+                while s_stripped and s_stripped[-1] in '}]':
+                    test_s = s_stripped[:-1]
+                    test_stripped = strip_strings(test_s)
+                    test_stack = []
+                    for char in test_stripped:
+                        if char in '{[':
+                            test_stack.append(char)
+                        elif char in '}]':
+                            expected = '{' if char == '}' else '['
+                            if test_stack and test_stack[-1] == expected:
+                                test_stack.pop()
                     
-                    # 重构这一行
-                    new_line = lines[error_line_idx].replace(error_line_text, 
-                                                              f"{left_part}\n    ], {right_part.strip()}")
-                    lines[error_line_idx] = new_line
-                    diagnostics.append(f"Split line {error_line_idx+1} and inserted ']'")
-                    
-                    result = '\n'.join(lines)
-                    result = clean_extra_brackets(result)
-                    return result, diagnostics
+                    if not test_stack:
+                        try:
+                            json.loads(test_s)
+                            return test_s
+                        except:
+                            s_stripped = test_s.rstrip()
+                    else:
+                        break
+        
+        return s
+    
+    @staticmethod
+    def balance_brackets(s: str) -> Tuple[str, List[str]]:
+        """改进的括号平衡函数：结合简单计数和智能栈追踪"""
+        # 先使用智能方法
+        s_new, diags1 = JSONRepairProcessor.balance_brackets_smart(s)
+        
+        # 如果仍有问题，使用简单方法作为后备
+        if s_new == s:
+            diagnostics = []
             
-            # 情况1: 如果前面有未闭合的数组，可能需要插入 ]
-            if '[' in unclosed:
-                # 在当前行之前查找合适的插入位置
-                for i in range(error_line_idx - 1, -1, -1):
-                    line = lines[i].strip()
-                    if line.endswith('}') or line.endswith(']'):
-                        # 在这一行后面插入闭合括号
-                        lines[i] = lines[i].rstrip() + ']'
-                        diagnostics.append(f"Inserted ']' after line {i+1} to close array")
-                        
-                        # 重新组合后，清理末尾可能多余的括号
-                        result = '\n'.join(lines)
-                        result = clean_extra_brackets(result)
-                        
-                        return result, diagnostics
+            def _strip_strings(text: str) -> str:
+                return re.sub(r'"([^"\\]|\\.)*"', '""', text)
             
-            # 情况2: 数组/对象已经闭合，但缺少逗号
-            # 在错误位置的前一行查找 ] 或 }，在其后添加逗号
-            elif error_line_idx > 0:
-                prev_line_idx = error_line_idx - 1
-                prev_line = lines[prev_line_idx].rstrip()
-                
-                # 如果前一行以 ] 或 } 结尾，且错误行是键名，添加逗号
-                if (prev_line.endswith(']') or prev_line.endswith('}')) and \
-                   (error_line_text.startswith('"') or error_line_text.startswith('{')):
-                    lines[prev_line_idx] = prev_line + ','
-                    diagnostics.append(f"Inserted ',' after line {prev_line_idx+1}")
-                    return '\n'.join(lines), diagnostics
+            t = _strip_strings(s)
+            
+            open_curly = t.count("{")
+            close_curly = t.count("}")
+            open_square = t.count("[")
+            close_square = t.count("]")
+            
+            need_curly = open_curly - close_curly
+            need_square = open_square - close_square
+            
+            if need_square > 0:
+                diagnostics.append(f"Appended {need_square} missing ']' at end")
+                s += "]" * need_square
+            
+            if need_curly > 0:
+                diagnostics.append(f"Appended {need_curly} missing '}}' at end")
+                s += "}" * need_curly
+            
+            return s, diagnostics
+        
+        return s_new, diags1
     
-    return s, diagnostics
-
-
-def clean_extra_brackets(s: str) -> str:
-    """
-    清理末尾可能多余的括号
-    """
-    # 移除字符串以便分析
-    def strip_strings(text: str) -> str:
-        in_string = False
-        escape_next = False
-        result = []
-        for char in text:
-            if escape_next:
-                escape_next = False
-                result.append(' ')
-                continue
-            if char == '\\':
-                escape_next = True
-                result.append(' ')
-                continue
-            if char == '"':
-                in_string = not in_string
-                result.append('"')
-            elif not in_string:
-                result.append(char)
-            else:
-                result.append(' ')
-        return ''.join(result)
-    
-    stripped = strip_strings(s)
-    
-    # 计算括号平衡
-    stack = []
-    for char in stripped:
-        if char in '{[':
-            stack.append(char)
-        elif char in '}]':
-            expected = '{' if char == '}' else '['
-            if stack and stack[-1] == expected:
-                stack.pop()
-            else:
-                # 有多余的闭合括号 - 需要从末尾移除
-                pass
-    
-    # 如果括号已经平衡，检查末尾是否有多余的
-    # 简单方法：尝试从末尾移除括号，看是否仍然平衡
-    if not stack:
-        # 已经平衡，检查是否能成功解析
+    @staticmethod
+    def try_parse_json(s: str) -> Tuple[bool, str]:
+        """尝试解析JSON字符串"""
         try:
-            json.loads(s)
-            return s  # 已经正确，不需要清理
-        except:
-            # 尝试移除末尾的多余括号
-            s_stripped = s.rstrip()
-            while s_stripped and s_stripped[-1] in '}]':
-                test_s = s_stripped[:-1]
-                # 检查移除后是否更平衡
-                test_stripped = strip_strings(test_s)
-                test_stack = []
-                for char in test_stripped:
-                    if char in '{[':
-                        test_stack.append(char)
-                    elif char in '}]':
-                        expected = '{' if char == '}' else '['
-                        if test_stack and test_stack[-1] == expected:
-                            test_stack.pop()
-                
-                if not test_stack:
-                    # 移除后仍然平衡，尝试解析
-                    try:
-                        json.loads(test_s)
-                        return test_s  # 成功！
-                    except:
-                        # 继续尝试
-                        s_stripped = test_s.rstrip()
-                else:
-                    break
+            obj = json.loads(s)
+            return True, json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return False, str(e)
     
-    return s
-
-
-def balance_brackets(s: str) -> Tuple[str, List[str]]:
-    """
-    改进的括号平衡函数：结合简单计数和智能栈追踪
-    """
-    # 先使用智能方法
-    s_new, diags1 = balance_brackets_smart(s)
-    
-    # 如果仍有问题，使用简单方法作为后备
-    if s_new == s:
-        diagnostics = []
+    @staticmethod
+    def repair_jsonish(raw: str, max_passes: int = 6) -> Tuple[str, str, List[str]]:
+        """
+        主修复逻辑 - 协调所有修复方法
         
-        def _strip_strings(text: str) -> str:
-            return re.sub(r'"([^"\\]|\\.)*"', '""', text)
+        Args:
+            raw: 原始JSON字符串
+            max_passes: 最大修复轮数，默认6
         
-        t = _strip_strings(s)
+        Returns:
+            (repaired_str, pretty_json_or_error, diagnostics)
+        """
+        diagnostics: List[str] = []
+        s = raw
         
-        open_curly = t.count("{")
-        close_curly = t.count("}")
-        open_square = t.count("[")
-        close_square = t.count("]")
+        # Pass 0: normalize line endings
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
         
-        need_curly = open_curly - close_curly
-        need_square = open_square - close_square
-        
-        if need_square > 0:
-            diagnostics.append(f"Appended {need_square} missing ']' at end")
-            s += "]" * need_square
-        
-        if need_curly > 0:
-            diagnostics.append(f"Appended {need_curly} missing '}}' at end")
-            s += "}" * need_curly
-        
-        return s, diagnostics
-    
-    return s_new, diags1
-
-
-def try_parse_json(s: str) -> Tuple[bool, str]:
-    try:
-        obj = json.loads(s)
-        return True, json.dumps(obj, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return False, str(e)
-
-
-def repair_jsonish(raw: str, max_passes: int = 6) -> Tuple[str, str, List[str]]:
-    diagnostics: List[str] = []
-    s = raw
-
-    # Pass 0: normalize line endings
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Apply a series of repair passes; attempt parse after each full pass
-    for p in range(1, max_passes + 1):
-        s = strip_comments(s)
-        s = normalize_literals(s)
-        # s = fix_chinese_quotes(s)  # 暂时禁用，避免副作用
-        s = quote_unquoted_keys(s)
-        s = escape_special_characters(s)
-        s = remove_duplicate_keys(s)
-        s = fix_missing_values(s)
-        s = insert_missing_commas(s)
-        s = remove_trailing_commas(s)
-
-        s, diags1 = fix_unclosed_strings_linewise(s)
-        diagnostics.extend([f"pass{p}: {d}" for d in diags1])
-
-        s, diags2 = balance_brackets(s)
-        diagnostics.extend([f"pass{p}: {d}" for d in diags2])
-
-        s, diags3 = fix_misplaced_brackets(s)
-        diagnostics.extend([f"pass{p}: {d}" for d in diags3])
-
-        # 清理可能多余的括号
-        if diags3:  # 如果进行了括号修复，清理多余的
-            s = clean_extra_brackets(s)
-
-        ok, out = try_parse_json(s)
-        if ok:
-            diagnostics.append(f"pass{p}: parsed successfully")
-            return s, out, diagnostics
-        else:
-            error_msg = str(out)
-            diagnostics.append(f"pass{p}: still invalid JSON -> {error_msg}")
+        # Apply a series of repair passes; attempt parse after each full pass
+        for p in range(1, max_passes + 1):
+            s = JSONRepairProcessor.strip_comments(s)
+            s = JSONRepairProcessor.normalize_literals(s)
+            s = JSONRepairProcessor.quote_unquoted_keys(s)
+            s = JSONRepairProcessor.escape_special_characters(s)
+            s = JSONRepairProcessor.remove_duplicate_keys(s)
+            s = JSONRepairProcessor.fix_missing_values(s)
+            s = JSONRepairProcessor.insert_missing_commas(s)
+            s = JSONRepairProcessor.remove_trailing_commas(s)
             
-            # 基于错误信息的智能修复
-            if "Expecting ','" in error_msg or "Expecting ':'" in error_msg:
-                s_fixed, diags3 = smart_insert_brackets_by_error(s, error_msg)
-                if s_fixed != s:
-                    diagnostics.extend([f"pass{p}: {d}" for d in diags3])
-                    s = s_fixed
-                    # 再次尝试解析
-                    ok, out = try_parse_json(s)
-                    if ok:
-                        diagnostics.append(f"pass{p}: parsed successfully after smart fix")
-                        return s, out, diagnostics
+            s, diags1 = JSONRepairProcessor.fix_unclosed_strings_linewise(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags1])
+            
+            s, diags2 = JSONRepairProcessor.balance_brackets(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags2])
+            
+            s, diags3 = JSONRepairProcessor.fix_misplaced_brackets(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags3])
+            
+            # 清理可能多余的括号
+            if diags3:
+                s = JSONRepairProcessor.clean_extra_brackets(s)
+            
+            ok, out = JSONRepairProcessor.try_parse_json(s)
+            if ok:
+                diagnostics.append(f"pass{p}: parsed successfully")
+                return s, out, diagnostics
+            else:
+                error_msg = str(out)
+                diagnostics.append(f"pass{p}: still invalid JSON -> {error_msg}")
+                
+                # 基于错误信息的智能修复
+                if "Expecting ','" in error_msg or "Expecting ':'" in error_msg:
+                    s_fixed, diags4 = JSONRepairProcessor.smart_insert_brackets_by_error(s, error_msg)
+                    if s_fixed != s:
+                        diagnostics.extend([f"pass{p}: {d}" for d in diags4])
+                        s = s_fixed
+                        ok, out = JSONRepairProcessor.try_parse_json(s)
+                        if ok:
+                            diagnostics.append(f"pass{p}: parsed successfully after smart fix")
+                            return s, out, diagnostics
+        
+        # Final failure
+        ok, out = JSONRepairProcessor.try_parse_json(s)
+        return s, out, diagnostics
 
-    # Final failure
-    ok, out = try_parse_json(s)
-    return s, out, diagnostics
 
+# ============================================================================
+# 第二层：用户接口类 - 简化的API
+# ============================================================================
 
 class JSONRepairTool:
+    """
+    JSON修复工具 - 用户友好接口
+    
+    职责：
+    - 提供简单直观的API
+    - 管理修复状态
+    - 内部使用 JSONRepairProcessor 进行实际修复
+    - 支持打印和返回结果
+    
+    使用示例：
+        >>> tool = JSONRepairTool('{ name: "test" }')
+        >>> tool.repair()
+        >>> result = tool.get_result()
+    """
     def __init__(self, input_data: str):
         self.raw_data = input_data
+        self.repaired = None
+        self.pretty_or_err = None
+        self.diagnostics = []
+        self.success = False
 
-    def repair(self):
-        repaired, pretty_or_err, diagnostics = repair_jsonish(self.raw_data)
+    def repair(self) -> bool:
+        """
+        执行JSON修复
+        
+        Returns:
+            bool: 修复是否成功
+        """
+        repaired, pretty_or_err, diagnostics = JSONRepairProcessor.repair_jsonish(
+            self.raw_data
+        )
         self.repaired = repaired
         self.pretty_or_err = pretty_or_err
         self.diagnostics = diagnostics
+        self.success = JSONRepairProcessor.try_parse_json(self.repaired)[0]
+        return self.success
 
-    def output_to_console(self):
-        print("=== Diagnostics ===")
-        for d in self.diagnostics:
-            print(d)
+    def output_to_console(self, show_diagnostics=True):
+        """
+        输出修复结果到控制台（保留原有打印功能）
+        同时返回结构化的结果数据
+        
+        Args:
+            show_diagnostics: 是否显示诊断信息，默认True
+        
+        Returns:
+            dict: 包含修复结果的字典
+            {
+                'success': bool,           # 修复是否成功
+                'original': str,           # 原始数据
+                'repaired': str,           # 修复后的数据
+                'pretty_json': str,        # 格式化的JSON（如果成功）
+                'error': str,              # 错误信息（如果失败）
+                'diagnostics': list        # 诊断信息列表
+            }
+        """
+        # 原有的打印逻辑
+        if show_diagnostics:
+            print("=== Diagnostics ===")
+            for d in self.diagnostics:
+                print(d)
 
-        if try_parse_json(self.repaired)[0]:
+        if self.success:
             print(self.pretty_or_err)
         else:
             print("=== Repaired (but still not valid JSON) ===")
             print(self.repaired)
             print("\n=== Last parse error ===")
             print(self.pretty_or_err)
+        
+        # 新增：返回结构化数据
+        result = {
+            'success': self.success,
+            'original': self.raw_data,
+            'repaired': self.repaired,
+            'diagnostics': self.diagnostics.copy()
+        }
+        
+        if self.success:
+            result['pretty_json'] = self.pretty_or_err
+            result['error'] = None
+        else:
+            result['pretty_json'] = None
+            result['error'] = self.pretty_or_err
+        
+        return result
 
-def main():
-    # 示例 JSON 数据（未修复的 JSON 字符串）
-    input_data = [
+    def get_result(self):
+        """
+        获取修复结果（不打印，只返回数据）
+        适用于工程化调用
+        
+        Returns:
+            dict: 包含修复结果的字典
+        """
+        result = {
+            'success': self.success,
+            'original': self.raw_data,
+            'repaired': self.repaired,
+            'diagnostics': self.diagnostics.copy()
+        }
+        
+        if self.success:
+            result['pretty_json'] = self.pretty_or_err
+            result['error'] = None
+            # 解析为Python对象
+            try:
+                result['json_object'] = json.loads(self.repaired)
+            except:
+                result['json_object'] = None
+        else:
+            result['pretty_json'] = None
+            result['error'] = self.pretty_or_err
+            result['json_object'] = None
+        
+        return result
+
+# ============================================================================
+# 第三层：服务类 - 批处理和测试管理
+# ============================================================================
+
+class JSONRepairService:
+    """
+    JSON修复服务 - 高级封装
+    
+    职责：
+    - 批量处理多个JSON字符串
+    - 管理测试案例和运行测试
+    - 生成统计报告
+    - 提供工程化API
+    
+    使用示例：
+        >>> service = JSONRepairService()
+        >>> summary = service.run_tests()  # 运行所有测试
+        >>> result = service.repair_single('{ broken json }')  # 单个修复
+        >>> results = service.repair_batch([json1, json2, json3])  # 批量修复
+    """
+    
+    def __init__(self, test_cases=None):
+        """
+        初始化修复服务
+        
+        Args:
+            test_cases: 可选的测试案例列表，如果不提供则使用默认测试案例
+        """
+        if test_cases is None:
+            self.test_cases = self._get_default_test_cases()
+        else:
+            self.test_cases = test_cases
+        
+        self.results = []  # 存储所有修复结果
+    
+    def _get_default_test_cases(self):
+        """获取默认的测试案例"""
+        return [
         #示例1：键名缺失双引号+值双引号没有闭合
         """
         {
@@ -846,20 +932,138 @@ def main():
           }
         }
         """
-    ]
-
-    # 实例化 JSONRepairTool 类
-    for i, case in enumerate(input_data, start=1):
-        print(f"=== 测试案例 {i} ===")
-        tool = JSONRepairTool(input_data=case)  # 传递单个测试案例
+        ]
+    
+    def repair_single(self, json_string: str, silent=False):
+        """
+        修复单个JSON字符串
+        
+        Args:
+            json_string: 需要修复的JSON字符串
+            silent: 是否静默模式（不打印），默认False
+        
+        Returns:
+            dict: 修复结果
+        """
+        tool = JSONRepairTool(input_data=json_string)
         tool.repair()
+        
+        if not silent:
+            tool.output_to_console()
+        
+        return tool.get_result()
+    
+    def repair_batch(self, json_strings: list, silent=False):
+        """
+        批量修复多个JSON字符串
+        
+        Args:
+            json_strings: JSON字符串列表
+            silent: 是否静默模式（不打印），默认False
+        
+        Returns:
+            list: 修复结果列表
+        """
+        results = []
+        for i, json_str in enumerate(json_strings, start=1):
+            if not silent:
+                print(f"\n=== 处理案例 {i}/{len(json_strings)} ===")
+            
+            result = self.repair_single(json_str, silent=silent)
+            results.append(result)
+        
+        return results
+    
+    def run_tests(self, show_diagnostics=True):
+        """
+        运行所有测试案例
+        
+        Args:
+            show_diagnostics: 是否显示诊断信息
+        
+        Returns:
+            dict: 包含统计信息和详细结果
+            {
+                'total': int,           # 总案例数
+                'success': int,         # 成功数
+                'failed': int,          # 失败数
+                'success_rate': float,  # 成功率
+                'results': list         # 详细结果列表
+            }
+        """
+        self.results = []
+        success_count = 0
+        
+        for i, case in enumerate(self.test_cases, start=1):
+            print(f"\n=== 测试案例 {i} ===")
+            print(f"测试案例 {i} 的修复结果：")
+            
+            tool = JSONRepairTool(input_data=case)
+            tool.repair()
+            result = tool.output_to_console(show_diagnostics=show_diagnostics)
+            
+            self.results.append({
+                'case_number': i,
+                'result': result
+            })
+            
+            if result['success']:
+                success_count += 1
+        
+        # 统计信息
+        total = len(self.test_cases)
+        summary = {
+            'total': total,
+            'success': success_count,
+            'failed': total - success_count,
+            'success_rate': (success_count / total * 100) if total > 0 else 0,
+            'results': self.results
+        }
+        
+        # 打印统计
+        print(f"\n{'='*70}")
+        print(f"测试完成统计:")
+        print(f"  总案例数: {summary['total']}")
+        print(f"  成功: {summary['success']}")
+        print(f"  失败: {summary['failed']}")
+        print(f"  成功率: {summary['success_rate']:.1f}%")
+        print(f"{'='*70}")
+        
+        return summary
+    
+    def get_statistics(self):
+        """
+        获取统计信息（无需重新运行测试）
+        
+        Returns:
+            dict: 统计信息
+        """
+        if not self.results:
+            return {
+                'total': 0,
+                'success': 0,
+                'failed': 0,
+                'success_rate': 0,
+                'message': '还未运行测试'
+            }
+        
+        total = len(self.results)
+        success = sum(1 for r in self.results if r['result']['success'])
+        
+        return {
+            'total': total,
+            'success': success,
+            'failed': total - success,
+            'success_rate': (success / total * 100) if total > 0 else 0
+        }
 
-        # 输出修复结果到控制台
-        print(f"测试案例 {i} 的修复结果：")
-        tool.output_to_console()
 
-    # 输出修复结果到文件
-    # tool.output_to_file("output.txt")
+def main():
+    """
+    主函数 - 用于直接运行测试
+    """
+    service = JSONRepairService()
+    service.run_tests()
 
 
 if __name__ == "__main__":
