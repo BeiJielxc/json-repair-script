@@ -34,22 +34,92 @@ class JSONRepairProcessor:
     RE_TRUE = re.compile(r"\bTrue\b")
     RE_FALSE = re.compile(r"\bFalse\b")
     RE_NULL_UPPER = re.compile(r"\bNULL\b")
+
+    RE_BARE_KV_SNIPPET = re.compile(r'^\s*"\s*[^"]+\s*"\s*:\s*', re.S)
+    RE_REMOVE_QUOTE_AFTER_CONTAINER = re.compile(r'([}\]])\s*"\s*(?=,|\}|\]|$)')
     
     # ========== 基础清理方法 ==========
+
+    @staticmethod
+    def _compute_string_ranges(s: str) -> List[Tuple[int, int]]:
+        """
+        计算 JSON 文本中字符串字面量的区间（包含引号本身）。
+        注意：该方法基于 JSON 的转义规则（\\ 和 \") 做近似扫描；
+        对“未闭合字符串”会把区间延伸到文本末尾。
+        """
+        ranges: List[Tuple[int, int]] = []
+        in_string = False
+        escape_next = False
+        start = -1
+
+        for i, ch in enumerate(s):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                if not in_string:
+                    in_string = True
+                    start = i
+                else:
+                    in_string = False
+                    ranges.append((start, i))
+                    start = -1
+
+        if in_string and start >= 0:
+            ranges.append((start, len(s) - 1))
+
+        return ranges
+
+    @staticmethod
+    def _index_in_ranges(idx: int, ranges: List[Tuple[int, int]]) -> bool:
+        """idx 是否落在任一 (start, end) 闭区间内"""
+        # ranges 通常很少，用线性扫描即可；如后续性能需要再做二分
+        for a, b in ranges:
+            if a <= idx <= b:
+                return True
+        return False
+
+    @staticmethod
+    def _sub_outside_strings(s: str, regex: re.Pattern, repl) -> str:
+        """
+        仅对“字符串字面量之外”的匹配进行替换。
+        repl 可为字符串或 callable(match) -> str，行为类似 re.sub。
+        """
+        ranges = JSONRepairProcessor._compute_string_ranges(s)
+        out = []
+        last = 0
+
+        for m in regex.finditer(s):
+            if JSONRepairProcessor._index_in_ranges(m.start(), ranges):
+                continue
+            out.append(s[last:m.start()])
+            if callable(repl):
+                out.append(repl(m))
+            else:
+                out.append(m.expand(repl))
+            last = m.end()
+
+        out.append(s[last:])
+        return "".join(out)
     
     @staticmethod
     def strip_comments(s: str) -> str:
         """去除JSON字符串中的注释"""
-        s2 = JSONRepairProcessor.RE_BLOCK_COMMENT.sub("", s)
-        s3 = JSONRepairProcessor.RE_LINE_COMMENT.sub("", s2)
+        # 仅在字符串之外去注释，避免误删 URL/路径等文本
+        s2 = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_BLOCK_COMMENT, "")
+        s3 = JSONRepairProcessor._sub_outside_strings(s2, JSONRepairProcessor.RE_LINE_COMMENT, "")
         return s3
     
     @staticmethod
     def normalize_literals(s: str) -> str:
         """规范化布尔值和null字面量"""
-        s = JSONRepairProcessor.RE_TRUE.sub("true", s)
-        s = JSONRepairProcessor.RE_FALSE.sub("false", s)
-        s = JSONRepairProcessor.RE_NULL_UPPER.sub("null", s)
+        # 只在字符串之外规范化，避免把业务文本里的 True/False/NULL 改掉
+        s = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_TRUE, "true")
+        s = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_FALSE, "false")
+        s = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_NULL_UPPER, "null")
         return s
     
     @staticmethod
@@ -69,7 +139,7 @@ class JSONRepairProcessor:
         
         max_iterations = 10
         for _ in range(max_iterations):
-            new_s = JSONRepairProcessor.RE_UNQUOTED_KEY.sub(replacer, s)
+            new_s = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_UNQUOTED_KEY, replacer)
             if new_s == s:
                 break
             s = new_s
@@ -88,7 +158,7 @@ class JSONRepairProcessor:
         prev = None
         while prev != s:
             prev = s
-            s = JSONRepairProcessor.RE_TRAILING_COMMA.sub(r"\1", s)
+            s = JSONRepairProcessor._sub_outside_strings(s, JSONRepairProcessor.RE_TRAILING_COMMA, r"\1")
         return s
     
     @staticmethod
@@ -168,14 +238,30 @@ class JSONRepairProcessor:
         for _ in range(max_iterations):
             prev = s
             
-            s = JSONRepairProcessor.RE_MISSING_COMMA_OBJ.sub(r"\1, \2", s)
-            s = JSONRepairProcessor.RE_MISSING_COMMA_1.sub(r"\1, \2", s)
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, JSONRepairProcessor.RE_MISSING_COMMA_OBJ, r"\1, \2"
+            )
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, JSONRepairProcessor.RE_MISSING_COMMA_1, r"\1, \2"
+            )
             
-            s = re.sub(r'(\}|\])\s*\n\s*(\{|\[)', r'\1,\n\2', s)
-            s = re.sub(r'(\}|\])\s+(")', r'\1, \2', s)
-            s = re.sub(r'(\d+|"[^"]*")\s+("[\w]+"\s*:)', r'\1, \2', s)
-            s = re.sub(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
-            s = re.sub(r'(\}|\])\s*\n\s*("[\w]+"\s*:)', r'\1,\n\2', s)
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, re.compile(r'(\}|\])\s*\n\s*(\{|\[)'), r'\1,\n\2'
+            )
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, re.compile(r'(\}|\])\s+(")'), r'\1, \2'
+            )
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, re.compile(r'(\d+|"[^"]*")\s+("[\w]+"\s*:)'), r'\1, \2'
+            )
+            s = JSONRepairProcessor._sub_outside_strings(
+                s,
+                re.compile(r'(\d+|"[^"]*"|true|false|null)\s*\n\s*("[\w]+"\s*:)'),
+                r'\1,\n\2'
+            )
+            s = JSONRepairProcessor._sub_outside_strings(
+                s, re.compile(r'(\}|\])\s*\n\s*("[\w]+"\s*:)'), r'\1,\n\2'
+            )
             
             if s == prev:
                 break
@@ -194,7 +280,252 @@ class JSONRepairProcessor:
     @staticmethod
     def fix_missing_values(s: str) -> str:
         """修复键值对中缺失的值"""
-        return re.sub(r'"(\w+)":\s*,', r'"\1": null,', s)
+        return JSONRepairProcessor._sub_outside_strings(
+            s, re.compile(r'"(\w+)":\s*,'), r'"\1": null,'
+        )
+
+    @staticmethod
+    def wrap_bare_kv_snippet(s: str) -> Tuple[str, List[str]]:
+        """
+        如果输入是 `"key": value` 这样的片段（缺少最外层 `{}`），自动包一层对象壳。
+        这类输入在日志/截断文本里很常见。
+        """
+        diagnostics: List[str] = []
+        t = s.lstrip()
+        if not t:
+            return s, diagnostics
+
+        if t[0] not in "{[" and JSONRepairProcessor.RE_BARE_KV_SNIPPET.search(t):
+            diagnostics.append("wrapped bare key/value snippet with surrounding '{ }'")
+            return "{\n" + s + "\n}", diagnostics
+        return s, diagnostics
+
+    @staticmethod
+    def promote_stringified_json_values(s: str) -> Tuple[str, List[str]]:
+        """
+        处理一种非常常见的“粘贴错误”：
+        外层 JSON 里 `"result": "{ ... }"` 这样的字段，本应是字符串化 JSON，
+        但由于粘贴/转义丢失，导致字符串里出现未转义的 `"` 和裸换行，
+        使得外层 JSON 直接不合法。
+
+        策略：
+        - 当检测到值形如 `"key": "{ <换行/空格> "<something>": ...`（即 `{` 后面很快就出现未转义 `"`）
+          认为这是“被错误加引号的 JSON”，将其提升为真正的对象/数组：把 `:"{` 变为 `:{`
+        - 随后删除容器闭合后的残留 `"`（例如 `}"` / `]"`）
+        """
+        diagnostics: List[str] = []
+        out: List[str] = []
+        last = 0
+
+        # 匹配 `"key": "`（值的 opening quote）
+        for m in re.finditer(r'"([^"]+)"\s*:\s*"', s):
+            open_quote_pos = m.end() - 1
+            brace_pos = m.end()
+            if brace_pos >= len(s):
+                continue
+            if s[brace_pos] not in "{[":
+                continue
+
+            # lookahead: `{`/`[` 后跳过空白，看是否立刻遇到未转义引号 "
+            j = brace_pos + 1
+            while j < len(s) and s[j] in " \t\r\n":
+                j += 1
+            if j < len(s) and s[j] == '"':
+                # 这是“字符串化 JSON 但转义丢失”的典型特征：字符串里出现未转义的键引号
+                out.append(s[last:open_quote_pos])  # 不包含 opening quote
+                last = open_quote_pos + 1  # 跳过 opening quote
+                diagnostics.append(f"promoted stringified JSON value for key '{m.group(1)}' to real container")
+
+        if not out:
+            return s, diagnostics
+
+        out.append(s[last:])
+        s2 = "".join(out)
+
+        # 删除容器闭合后的残留引号，例如 `}"` / `]"`
+        s2 = JSONRepairProcessor._sub_outside_strings(s2, JSONRepairProcessor.RE_REMOVE_QUOTE_AFTER_CONTAINER, r"\1")
+
+        return s2, diagnostics
+
+    @staticmethod
+    def remove_stray_quote_after_number_token(s: str) -> Tuple[str, List[str]]:
+        """
+        移除一种典型的截断/拼接残片：数字 token 后面紧跟一个多余的 `"`，例如 `...[2", ...` 或 `... 123" ]`。
+        这个 `"` 会把后续文本错误地带入字符串，造成连锁解析失败。
+
+        规则（仅在字符串之外生效）：
+        - 遇到 `"` 时，若其前一个非空白字符属于数字 token（0-9 或 token 内字符 .+-eE），
+          且该数字 token 的起始前一字符不是 `"`（避免误伤 `"123"` 这类合法字符串），
+          且 `"` 后一个非空白字符是 `,` / `]` / `}`，则删除该 `"`。
+        """
+        diagnostics: List[str] = []
+        chars = list(s)
+        in_string = False
+        escape_next = False
+        removed = 0
+
+        def is_num_char(ch: str) -> bool:
+            return ch.isdigit() or ch in ".+-eE"
+
+        i = 0
+        while i < len(chars):
+            ch = chars[i]
+            if escape_next:
+                escape_next = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape_next = True
+                i += 1
+                continue
+            if ch == '"':
+                if not in_string:
+                    # 可能是“数字后多余的引号”
+                    # 向左找前一个非空白字符
+                    k = i - 1
+                    while k >= 0 and chars[k] in " \t\r\n":
+                        k -= 1
+                    if k >= 0 and is_num_char(chars[k]):
+                        # 找到数字 token 的起始
+                        start = k
+                        while start - 1 >= 0 and is_num_char(chars[start - 1]):
+                            start -= 1
+                        # token 起始前一个字符不能是引号（避免误伤字符串 "123"）
+                        prev = start - 1
+                        while prev >= 0 and chars[prev] in " \t\r\n":
+                            prev -= 1
+                        if prev < 0 or chars[prev] != '"':
+                            # 向右找后一个非空白字符
+                            j = i + 1
+                            while j < len(chars) and chars[j] in " \t\r\n":
+                                j += 1
+                            if j < len(chars) and chars[j] in ",]}":
+                                chars.pop(i)
+                                removed += 1
+                                # 不递增 i，继续检查当前位置
+                                continue
+                    # 普通开引号
+                    in_string = True
+                    i += 1
+                    continue
+                else:
+                    in_string = False
+                    i += 1
+                    continue
+            i += 1
+
+        if removed:
+            diagnostics.append(f"removed {removed} stray quote(s) after number token")
+        return "".join(chars), diagnostics
+
+    @staticmethod
+    def fix_unclosed_strings_global(s: str) -> Tuple[str, List[str]]:
+        """
+        全局修复未闭合字符串/末尾悬挂反斜杠，并把字符串中的“裸换行”转成 \\n。
+        这比逐行补引号更稳健，尤其适用于超长或跨行字符串（例如字段里塞了大段 JSON 文本）。
+        """
+        diagnostics: List[str] = []
+        out_chars: List[str] = []
+
+        in_string = False
+        escape_next = False
+
+        for ch in s:
+            if escape_next:
+                escape_next = False
+                out_chars.append(ch)
+                continue
+
+            if ch == "\\":
+                escape_next = True
+                out_chars.append(ch)
+                continue
+
+            if ch == '"':
+                in_string = not in_string
+                out_chars.append(ch)
+                continue
+
+            if in_string and ch == "\n":
+                out_chars.append("\\n")
+                diagnostics.append("escaped raw newline inside string as '\\n'")
+                continue
+
+            out_chars.append(ch)
+
+        if escape_next:
+            # 最末尾是悬挂的反斜杠，属于非法转义；保守起见移除
+            if out_chars and out_chars[-1] == "\\":
+                out_chars.pop()
+                diagnostics.append("removed dangling backslash at end of text")
+
+        if in_string:
+            out_chars.append('"')
+            diagnostics.append("appended missing '\"' at end (unterminated string)")
+
+        return "".join(out_chars), diagnostics
+
+    @staticmethod
+    def truncate_after_last_container_close(s: str) -> Tuple[str, List[str]]:
+        """
+        截断“尾部垃圾/截断残片”：
+        如果文本末尾因为复制截断导致出现半个 token（例如 `"coord": [2",` / 缺半个对象），
+        可尝试把内容截断到最后一个在字符串之外出现的 `}` 或 `]` 之后，
+        再交给括号平衡逻辑补齐外层结构。
+
+        这不会恢复缺失的数据，但能让 JSON 重新可解析（尽可能保留前面完整部分）。
+        """
+        diagnostics: List[str] = []
+        in_string = False
+        escape_next = False
+        last_close = -1
+
+        for i, ch in enumerate(s):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if not in_string and ch in "}]":
+                last_close = i
+
+        if last_close >= 0 and last_close < len(s) - 1:
+            tail = s[last_close + 1 :]
+            if tail.strip():
+                diagnostics.append("truncated trailing garbage after last '}'/']'")
+                return s[: last_close + 1], diagnostics
+
+        return s, diagnostics
+
+    @staticmethod
+    def truncate_around_error_position(s: str, error_msg: str) -> Tuple[str, List[str]]:
+        """
+        当解析错误指向某个 char 位置时，尝试从该位置起丢弃尾部，
+        并进一步截断到最后一个 `}`/`]`，用来应对“中途截断/半个 token”。
+        """
+        diagnostics: List[str] = []
+        m = re.search(r"\(char (\d+)\)", error_msg)
+        if not m:
+            return s, diagnostics
+        try:
+            pos = int(m.group(1))
+        except Exception:
+            return s, diagnostics
+        if pos <= 0 or pos >= len(s):
+            return s, diagnostics
+
+        prefix = s[:pos]
+        prefix2, diags2 = JSONRepairProcessor.truncate_after_last_container_close(prefix)
+        if prefix2 != prefix:
+            diagnostics.extend(diags2)
+        if prefix2 != s:
+            diagnostics.append("truncated text around JSON parse error position")
+            return prefix2, diagnostics
+        return s, diagnostics
     
     @staticmethod
     def fix_unclosed_strings_linewise(s: str) -> Tuple[str, List[str]]:
@@ -486,9 +817,28 @@ class JSONRepairProcessor:
         
         # Pass 0: normalize line endings
         s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Pre-pass: handle common snippet / pasted-string issues early
+        s, diags0a = JSONRepairProcessor.wrap_bare_kv_snippet(s)
+        diagnostics.extend([f"pre: {d}" for d in diags0a])
+
+        s, diags0b = JSONRepairProcessor.promote_stringified_json_values(s)
+        diagnostics.extend([f"pre: {d}" for d in diags0b])
+
+        s, diags0c = JSONRepairProcessor.remove_stray_quote_after_number_token(s)
+        diagnostics.extend([f"pre: {d}" for d in diags0c])
         
         # Apply a series of repair passes; attempt parse after each full pass
         for p in range(1, max_passes + 1):
+            # Repeat these cheap pre-fixes; earlier passes may expose new structure
+            s, diags_pre1 = JSONRepairProcessor.wrap_bare_kv_snippet(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags_pre1])
+            s, diags_pre2 = JSONRepairProcessor.promote_stringified_json_values(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags_pre2])
+
+            s, diags_pre3 = JSONRepairProcessor.remove_stray_quote_after_number_token(s)
+            diagnostics.extend([f"pass{p}: {d}" for d in diags_pre3])
+
             s = JSONRepairProcessor.strip_comments(s)
             s = JSONRepairProcessor.normalize_literals(s)
             s = JSONRepairProcessor.quote_unquoted_keys(s)
@@ -498,7 +848,7 @@ class JSONRepairProcessor:
             s = JSONRepairProcessor.insert_missing_commas(s)
             s = JSONRepairProcessor.remove_trailing_commas(s)
             
-            s, diags1 = JSONRepairProcessor.fix_unclosed_strings_linewise(s)
+            s, diags1 = JSONRepairProcessor.fix_unclosed_strings_global(s)
             diagnostics.extend([f"pass{p}: {d}" for d in diags1])
             
             s, diags2 = JSONRepairProcessor.balance_brackets(s)
@@ -518,6 +868,33 @@ class JSONRepairProcessor:
             else:
                 error_msg = str(out)
                 diagnostics.append(f"pass{p}: still invalid JSON -> {error_msg}")
+
+                # 先按错误位置截断（适配“中途截断/半 token”）
+                s_cut, diags_cut = JSONRepairProcessor.truncate_around_error_position(s, error_msg)
+                if s_cut != s:
+                    diagnostics.extend([f"pass{p}: {d}" for d in diags_cut])
+                    s = s_cut
+                    s = JSONRepairProcessor.remove_trailing_commas(s)
+                    s, diags_b0 = JSONRepairProcessor.balance_brackets(s)
+                    diagnostics.extend([f"pass{p}: {d}" for d in diags_b0])
+                    ok_cut, out_cut = JSONRepairProcessor.try_parse_json(s)
+                    if ok_cut:
+                        diagnostics.append(f"pass{p}: parsed successfully after error-position truncation")
+                        return s, out_cut, diagnostics
+
+                # 截断尾部残片（常见于复制/日志截断），再尝试一次
+                s_trunc, diags_trunc = JSONRepairProcessor.truncate_after_last_container_close(s)
+                if s_trunc != s:
+                    diagnostics.extend([f"pass{p}: {d}" for d in diags_trunc])
+                    s = s_trunc
+                    # 再做一次轻量清理 + 括号补齐
+                    s = JSONRepairProcessor.remove_trailing_commas(s)
+                    s, diags_b = JSONRepairProcessor.balance_brackets(s)
+                    diagnostics.extend([f"pass{p}: {d}" for d in diags_b])
+                    ok2, out2 = JSONRepairProcessor.try_parse_json(s)
+                    if ok2:
+                        diagnostics.append(f"pass{p}: parsed successfully after truncation")
+                        return s, out2, diagnostics
                 
                 # 基于错误信息的智能修复
                 if "Expecting ','" in error_msg or "Expecting ':'" in error_msg:

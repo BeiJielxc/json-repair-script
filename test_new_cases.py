@@ -110,6 +110,13 @@ new_test_cases = [
         }
     }
     """,
+
+    # 新案例9: 超长字符串字段被截断（类似 "result" 内嵌JSON文本，末尾缺引号/括号）
+    """
+    {
+      "status": "ok",
+      "result": "{\n  \\"total_rows\\": 2,\n  \\"rows\\": [\n    {\\"row_num\\": 1, \\"交易日期\\": {\\"content\\": \\"20210107\\"}},\n    {\\"row_num\\": 2, \\"交易日期\\": {\\"content\\": \\"20210112\\"}}\n  ]\n"
+    """
 ]
 
 print("=" * 70)
@@ -132,10 +139,10 @@ for i, case in enumerate(new_test_cases, start=1):
     try:
         json.loads(tool.repaired)
         success_count += 1
-        print(f"✅ 修复成功！")
+        print("[OK] 修复成功！")
         print(tool.pretty_or_err)
     except:
-        print(f"❌ 修复失败")
+        print("[FAIL] 修复失败")
         print("=== Diagnostics ===")
         for d in tool.diagnostics[-6:]:  # 只显示最后6条诊断
             print(d)
